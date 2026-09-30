@@ -22,7 +22,7 @@ get_public_ip() {
     curl -s4 --max-time 3 https://api.ipify.org || curl -s4 --max-time 3 https://ifconfig.me || echo "127.0.0.1"
 }
 
-# Optimize Linux Network Kernel for UDP/KCP
+# Optimize Linux Network Kernel for UDP Keep-Alive & Port-Hopping
 optimize_kernel() {
     echo -e "${YELLOW}[+] Optimizing system network parameters...${NC}"
     cat <<EOF > /etc/sysctl.d/99-gost-tunnel.conf
@@ -38,7 +38,7 @@ EOF
     sysctl --system >/dev/null 2>&1 || true
 }
 
-# Install GOST v2.11.5 Stable and System Tools
+# Install GOST and System Tools (Fixed Official v2.11.5 Binary)
 install_dependencies() {
     echo -e "${YELLOW}[+] Installing dependencies...${NC}"
     apt-get update -y >/dev/null 2>&1
@@ -49,7 +49,7 @@ install_dependencies() {
     optimize_kernel
 
     if ! command -v gost &>/dev/null; then
-        echo -e "${YELLOW}[+] Downloading GOST core binary (v2.11.5)...${NC}"
+        echo -e "${YELLOW}[+] Downloading GOST core binary...${NC}"
         ARCH=$(uname -m)
         case $ARCH in
             x86_64)  GOST_FILE="gost-linux-amd64-2.11.5.gz" ;;
@@ -70,7 +70,7 @@ install_dependencies() {
         gzip -d -f /tmp/gost.gz
         mv /tmp/gost /usr/local/bin/gost
         chmod +x /usr/local/bin/gost
-        echo -e "${GREEN}[✓] GOST core binary installed.${NC}"
+        echo -e "${GREEN}[✓] GOST installed.${NC}"
     fi
 }
 
@@ -90,7 +90,7 @@ setup_outside() {
     TUNNEL_NAME=${TUNNEL_NAME:-main}
     SERVICE_NAME="gost-server-${TUNNEL_NAME}"
 
-    read -p "KCP Listen Port [Default: 8443]: " KCP_PORT
+    read -p "KCP Base Port [Default: 8443]: " KCP_PORT
     KCP_PORT=${KCP_PORT:-8443}
 
     read -p "Enable Port-Hopping (50 Ports)? (y/n) [Default: y]: " ENABLE_HOP
@@ -141,16 +141,14 @@ EOF
     MY_IP=$(get_public_ip)
     echo -e "\n${GREEN}[✓] Outside Node configured and running.${NC}"
     echo -e "--------------------------------------------------"
-    echo -e "Tunnel Name   : ${CYAN}${TUNNEL_NAME}${NC}"
-    echo -e "Server IP     : ${CYAN}${MY_IP}${NC}"
-    echo -e "KCP Base Port : ${CYAN}${KCP_PORT}${NC}"
+    echo -e "Tunnel Name  : ${CYAN}${TUNNEL_NAME}${NC}"
+    echo -e "Server IP    : ${CYAN}${MY_IP}${NC}"
+    echo -e "KCP Port     : ${CYAN}${KCP_PORT}${NC}"
     if [[ "$ENABLE_HOP" =~ ^[Yy]$ ]]; then
-        echo -e "Port-Hopping  : ${GREEN}Active (Range: ${HOP_RANGE})${NC}"
-    else
-        echo -e "Port-Hopping  : ${YELLOW}Disabled${NC}"
+        echo -e "Port-Hopping : ${GREEN}Active (${HOP_RANGE})${NC}"
     fi
-    echo -e "MTU           : ${CYAN}${MTU_SIZE}${NC}"
-    echo -e "Security Key  : ${YELLOW}${CIPHER_KEY}${NC}"
+    echo -e "MTU          : ${CYAN}${MTU_SIZE}${NC}"
+    echo -e "Security Key : ${YELLOW}${CIPHER_KEY}${NC}"
     echo -e "--------------------------------------------------"
     read -p "Press Enter to return to main menu..." DUMMY
 }
@@ -230,96 +228,58 @@ EOF
     echo -e "--------------------------------------------------"
     echo -e "Service Name   : ${CYAN}${SERVICE_NAME}${NC}"
     echo -e "Forward Ports  : ${CYAN}${FORWARD_PORTS}${NC}"
-    echo -e "Target Node    : ${CYAN}${REMOTE_IP}:${REMOTE_KCP_PORT}${NC}"
+    echo -e "Destination    : ${CYAN}${REMOTE_IP}:${REMOTE_KCP_PORT}${NC}"
     echo -e "MTU            : ${CYAN}${MTU_SIZE}${NC}"
     echo -e "Keep-Alive     : ${GREEN}Enabled (10s Heartbeat + 120s NAT TTL)${NC}"
     echo -e "--------------------------------------------------"
     read -p "Press Enter to return to main menu..." DUMMY
 }
 
-# Interactive Spinner Loading Function
-run_spinner() {
-    local PID=$1
-    local MSG=$2
-    local SPINS=('-' '\' '|' '/')
-    echo -ne "${YELLOW}${MSG} ${NC}"
-    while kill -0 "$PID" 2>/dev/null; do
-        for S in "${SPINS[@]}"; do
-            echo -ne "\b${CYAN}${S}${NC}"
-            sleep 0.1
-        done
-    done
-    echo -ne "\b \n"
-}
-
-# 3. Interactive Tunnel Tester (Pair Handshake Test)
+# 3. Network Diagnostics and Auto-MTU Sweeper
 test_network() {
-    install_dependencies
-    clear
+    echo -e "\n${CYAN}==================================================${NC}"
+    echo -e "${GREEN}         Network & Auto-MTU Diagnostics           ${NC}"
     echo -e "${CYAN}==================================================${NC}"
-    echo -e "${GREEN}       Interactive Tunnel Pair Verification       ${NC}"
-    echo -e "${CYAN}==================================================${NC}"
-    echo "1. Run as OUTSIDE Receiver (Generates Test Token)"
-    echo "2. Run as IRAN Sender (Connects to Test Token)"
-    echo "0. Back to Main Menu"
-    echo "--------------------------------------------------"
-    read -p "Select Mode [0-2]: " TEST_ROLE
 
-    case $TEST_ROLE in
-        1)
-            TEST_PORT=39481
-            iptables -I INPUT -p udp --dport "$TEST_PORT" -j ACCEPT 2>/dev/null || true
-            OUTSIDE_IP=$(get_public_ip)
-            TOKEN_STR="${OUTSIDE_IP}:${TEST_PORT}"
+    read -p "Remote Server IP / Hostname: " DEST_IP
+    if [ -z "$DEST_IP" ]; then
+        echo -e "${RED}[!] IP cannot be empty.${NC}"
+        return
+    fi
 
-            echo -e "\n${GREEN}[✓] Outside test listener is ready!${NC}"
-            echo -e "Copy this token string and paste it into Iran test runner:"
-            echo -e "--------------------------------------------------"
-            echo -e "TOKEN: ${CYAN}${TOKEN_STR}${NC}"
-            echo -e "--------------------------------------------------"
-            echo -e "${YELLOW}Waiting for Iran ping... (Press Ctrl+C to stop)${NC}\n"
+    read -p "Target KCP Port [Default: 8443]: " DEST_PORT
+    DEST_PORT=${DEST_PORT:-8443}
 
-            # Run a temporary silent listener
-            nc -u -l -p "$TEST_PORT"
-            echo -e "\n${GREEN}[✓] Packet successfully received from Iran! Network path is OPEN.${NC}"
-            read -p "Press Enter to return..." DUMMY
-            ;;
-        2)
-            read -p "Paste Outside Test Token (IP:Port): " TARGET_TOKEN
-            if [ -z "$TARGET_TOKEN" ]; then
-                echo -e "${RED}[!] Token cannot be empty.${NC}"
-                sleep 2
-                return
-            fi
+    echo -e "\n${YELLOW}[1] Ping & Latency Check...${NC}"
+    ping -c 4 "$DEST_IP" || echo -e "${RED}[!] ICMP ping dropped.${NC}"
 
-            DEST_IP=$(echo "$TARGET_TOKEN" | cut -d ':' -f 1)
-            DEST_PORT=$(echo "$TARGET_TOKEN" | cut -d ':' -f 2)
+    echo -e "\n${YELLOW}[2] Port Reachability Check...${NC}"
+    if nc -z -v -w3 "$DEST_IP" "$DEST_PORT" 2>&1 | grep -q -E "succeeded|open"; then
+        echo -e "${GREEN}[✓] Port ${DEST_PORT} is reachable.${NC}"
+    else
+        echo -e "${YELLOW}[!] Raw port check produced no direct ACK (Normal for silent UDP/KCP).${NC}"
+    fi
 
-            (
-                for i in {1..5}; do
-                    echo "TEST_PACKET_$i" | nc -u -w1 "$DEST_IP" "$DEST_PORT" 2>/dev/null || true
-                    sleep 0.3
-                done
-            ) &
-            TEST_PID=$!
+    echo -e "\n${YELLOW}[3] MTU Sweeper (Checking fragmentation threshold)...${NC}"
+    MTU_TESTS=(1500 1450 1400 1350 1300 1250)
+    BEST_MTU=1350
 
-            run_spinner "$TEST_PID" "Performing UDP handshake and probing path to ${DEST_IP}..."
+    for MTU in "${MTU_TESTS[@]}"; do
+        PACKET_SIZE=$((MTU - 28))
+        echo -ne "Testing MTU ${MTU} (Payload: ${PACKET_SIZE})... "
+        if ping -M do -s "$PACKET_SIZE" -c 2 -W 2 "$DEST_IP" >/dev/null 2>&1; then
+            echo -e "${GREEN}Passed (No Fragmentation)${NC}"
+            BEST_MTU=$MTU
+            break
+        else
+            echo -e "${RED}Fragmented / Dropped${NC}"
+        fi
+    done
 
-            echo -e "\n${CYAN}--- Diagnostics Results ---${NC}"
-            if ping -c 3 -W 2 "$DEST_IP" >/dev/null 2>&1; then
-                AVG_PING=$(ping -c 3 -W 2 "$DEST_IP" | tail -1 | awk '{print $4}' | cut -d '/' -f 2)
-                echo -e "ICMP Network Ping : ${GREEN}OK (~${AVG_PING} ms)${NC}"
-            else
-                echo -e "ICMP Network Ping : ${YELLOW}Dropped (Firewall blocked ICMP - Normal)${NC}"
-            fi
-
-            echo -e "KCP/UDP Test Packets: ${GREEN}Sent successfully to port ${DEST_PORT}.${NC}"
-            echo -e "Check Outside console: If Outside verified reception, the tunnel path is 100% healthy."
-            echo -e "--------------------------------------------------"
-            read -p "Press Enter to return..." DUMMY
-            ;;
-        *) return ;;
-    esac
+    echo -e "\n--------------------------------------------------"
+    echo -e "Recommended MTU: ${GREEN}${BEST_MTU}${NC}"
+    echo -e "--------------------------------------------------"
+    read -p "Press Enter to return..." DUMMY
 }
 
 # 4. Auto-Restart Scheduled Watchdog
@@ -358,7 +318,7 @@ setup_timer() {
             read -p "Enter interval in hours (1-23): " CUSTOM_H
             if [[ "$CUSTOM_H" =~ ^[0-9]+$ ]] && [ "$CUSTOM_H" -ge 1 ] && [ "$CUSTOM_H" -le 23 ]; then
                 echo "0 */${CUSTOM_H} * * * root systemctl restart 'gost-*' >/dev/null 2>&1" > "$CRON_FILE"
-                chmod 644 "$CRON_FILE"
+                chmod 644 "$CUSTOM_H"
                 echo -e "${GREEN}[✓] Auto-restart set to EVERY ${CUSTOM_H} HOURS.${NC}"
             else
                 echo -e "${RED}[!] Invalid hour value.${NC}"
@@ -535,7 +495,7 @@ main_menu() {
         echo -e "${CYAN}==================================================${NC}"
         echo -e "1. ${BLUE}[STEP 1]${NC} Setup Outside Node (Server)"
         echo -e "2. ${BLUE}[STEP 2]${NC} Setup Iran Node (Client)"
-        echo -e "3. ${YELLOW}[TEST]${NC}   Interactive Tunnel Pair Verification"
+        echo -e "3. Network Diagnostics & Auto-MTU Sweeper"
         echo -e "4. Configure Auto-Restart Timer (Watchdog)"
         echo -e "5. ${YELLOW}[EDIT]${NC}   Edit Tunnel Configuration (MTU / Ports)"
         echo -e "6. ${RED}[DELETE]${NC} Delete Tunnel by Index Number"
