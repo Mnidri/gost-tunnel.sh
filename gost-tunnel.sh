@@ -13,7 +13,7 @@ NC='\033[0m'
 
 # Check Root Access
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[!] Lotfan ba dastresi root ejra konid (sudo -i).${NC}"
+    echo -e "${RED}[!] Please run as root (sudo -i).${NC}"
     exit 1
 fi
 
@@ -22,20 +22,38 @@ get_public_ip() {
     curl -s4 --max-time 3 https://api.ipify.org || curl -s4 --max-time 3 https://ifconfig.me || echo "127.0.0.1"
 }
 
-# Install GOST and Tools
+# Optimize Linux Network Kernel for UDP Keep-Alive
+optimize_kernel() {
+    echo -e "${YELLOW}[+] Optimizing system network parameters...${NC}"
+    cat <<EOF > /etc/sysctl.d/99-gost-tunnel.conf
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.netfilter.nf_conntrack_udp_timeout=120
+net.netfilter.nf_conntrack_udp_timeout_stream=300
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+}
+
+# Install GOST and System Tools
 install_dependencies() {
-    echo -e "${YELLOW}[+] Dar hale barresi va nasbe pish-niazha...${NC}"
+    echo -e "${YELLOW}[+] Installing dependencies...${NC}"
     apt-get update -y >/dev/null 2>&1
-    apt-get install -y curl wget tar iptables netcat-openbsd iputils-ping nano >/dev/null 2>&1
+    apt-get install -y curl wget tar iptables netcat-openbsd iputils-ping cron >/dev/null 2>&1
+    systemctl enable cron >/dev/null 2>&1 || true
+    systemctl start cron >/dev/null 2>&1 || true
+
+    optimize_kernel
 
     if ! command -v gost &>/dev/null; then
-        echo -e "${YELLOW}[+] GOST peyda nashod. Dar hale download va nasb...${NC}"
+        echo -e "${YELLOW}[+] Downloading GOST core binary...${NC}"
         ARCH=$(uname -m)
         case $ARCH in
             x86_64) GOST_ARCH="linux-amd64" ;;
             aarch64) GOST_ARCH="linux-arm64" ;;
             armv7l) GOST_ARCH="linux-armv7" ;;
-            *) echo -e "${RED}[!] Memari CPU ($ARCH) support nemishavad.${NC}"; exit 1 ;;
+            *) echo -e "${RED}[!] Architecture $ARCH is not supported.${NC}"; exit 1 ;;
         esac
 
         LATEST_URL=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep "browser_download_url.*${GOST_ARCH}.*tar.gz" | head -n 1 | cut -d '"' -f 4)
@@ -48,7 +66,7 @@ install_dependencies() {
         mv /tmp/gost /usr/local/bin/gost
         chmod +x /usr/local/bin/gost
         rm -rf /tmp/gost*
-        echo -e "${GREEN}[✓] GOST ba movafaghiat nasb shod.${NC}"
+        echo -e "${GREEN}[✓] GOST installed.${NC}"
     fi
 }
 
@@ -56,27 +74,27 @@ generate_random_key() {
     tr -dc A-Za-z0-9 </dev/urandom | head -c 16
 }
 
-# 1. Setup Server (Kharej)
-setup_kharej() {
+# 1. Setup Outside Node (Server)
+setup_outside() {
     install_dependencies
     echo -e "\n${CYAN}==================================================${NC}"
-    echo -e "${GREEN}   STEP 1: Setup Server KHAREJ (Outside Node)    ${NC}"
+    echo -e "${GREEN}      Setup Outside Node (Server / Listener)      ${NC}"
     echo -e "${CYAN}==================================================${NC}"
-    echo -e "${YELLOW}In marhale bayad AVAL rooye server Kharej ejra shavad.${NC}\n"
+    echo -e "${YELLOW}Notice: Run this step on the Outside server FIRST.${NC}\n"
 
-    read -p "Tunnel Name / Shenaseye Tunnel [Default: main]: " TUNNEL_NAME
+    read -p "Tunnel Name [Default: main]: " TUNNEL_NAME
     TUNNEL_NAME=${TUNNEL_NAME:-main}
     SERVICE_NAME="gost-server-${TUNNEL_NAME}"
 
-    read -p "KCP Tunnel Port rooye Kharej [Default: 8443]: " KCP_PORT
+    read -p "KCP Listen Port [Default: 8443]: " KCP_PORT
     KCP_PORT=${KCP_PORT:-8443}
 
     read -p "MTU Size [Default: 1350]: " MTU_SIZE
     MTU_SIZE=${MTU_SIZE:-1350}
 
     SUGGESTED_KEY=$(generate_random_key)
-    echo -e "Pishnahad Password: ${GREEN}$SUGGESTED_KEY${NC}"
-    read -p "Secret Encryption Key (Enter bezanid ta hamin set shavad): " CIPHER_KEY
+    echo -e "Suggested Key: ${GREEN}$SUGGESTED_KEY${NC}"
+    read -p "Security Key (Press Enter to use suggested): " CIPHER_KEY
     CIPHER_KEY=${CIPHER_KEY:-$SUGGESTED_KEY}
 
     iptables -I INPUT -p udp --dport "$KCP_PORT" -j ACCEPT 2>/dev/null || true
@@ -89,7 +107,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/gost -L "relay+kcp://:${KCP_PORT}?nodelay=1&interval=5&resend=1&nc=1&sndwnd=4096&rcvwnd=4096&mtu=${MTU_SIZE}&crypt=aes&key=${CIPHER_KEY}"
+ExecStart=/usr/local/bin/gost -L "relay+kcp://:${KCP_PORT}?nodelay=1&interval=10&resend=1&nc=1&sndwnd=4096&rcvwnd=4096&mtu=${MTU_SIZE}&crypt=aes&key=${CIPHER_KEY}&keepalive=10s"
 Restart=always
 RestartSec=3
 
@@ -102,55 +120,55 @@ EOF
     systemctl restart "${SERVICE_NAME}"
 
     MY_IP=$(get_public_ip)
-    echo -e "\n${GREEN}[✓] Server Kharej ba movafaghiat run shod!${NC}"
+    echo -e "\n${GREEN}[✓] Outside Node configured and running.${NC}"
     echo -e "--------------------------------------------------"
-    echo -e "Tunnel Name : ${CYAN}${TUNNEL_NAME}${NC}"
-    echo -e "Server IP   : ${CYAN}${MY_IP}${NC}"
-    echo -e "KCP Port    : ${CYAN}${KCP_PORT}${NC}"
-    echo -e "MTU         : ${CYAN}${MTU_SIZE}${NC}"
-    echo -e "Secret Key  : ${YELLOW}${CIPHER_KEY}${NC}"
+    echo -e "Tunnel Name  : ${CYAN}${TUNNEL_NAME}${NC}"
+    echo -e "Server IP    : ${CYAN}${MY_IP}${NC}"
+    echo -e "KCP Port     : ${CYAN}${KCP_PORT}${NC}"
+    echo -e "MTU          : ${CYAN}${MTU_SIZE}${NC}"
+    echo -e "Security Key : ${YELLOW}${CIPHER_KEY}${NC}"
     echo -e "--------------------------------------------------"
-    read -p "Enter bezanid ta be menu bargardid..." DUMMY
+    read -p "Press Enter to return to main menu..." DUMMY
 }
 
-# 2. Setup Client (Iran)
+# 2. Setup Iran Node (Client)
 setup_iran() {
     install_dependencies
     echo -e "\n${CYAN}==================================================${NC}"
-    echo -e "${GREEN}    STEP 2: Setup Server IRAN (Client/Relay)     ${NC}"
+    echo -e "${GREEN}     Setup Iran Node (Client / Port Forwarder)    ${NC}"
     echo -e "${CYAN}==================================================${NC}"
-    echo -e "${YELLOW}In marhale rooye server IRAN ejra mishavad.${NC}\n"
+    echo -e "${YELLOW}Notice: Run this step on the Iran server SECOND.${NC}\n"
 
-    read -p "Tunnel Name (Baraye jelogiri az tadakhol) [Default: main]: " TUNNEL_NAME
+    read -p "Tunnel Name [Default: main]: " TUNNEL_NAME
     TUNNEL_NAME=${TUNNEL_NAME:-main}
     SERVICE_NAME="gost-client-${TUNNEL_NAME}"
 
-    read -p "IP Server Kharej (Remote Server IP): " REMOTE_IP
+    read -p "Outside Server IP / Hostname: " REMOTE_IP
     while [ -z "$REMOTE_IP" ]; do
-        echo -e "${RED}[!] IP nemitavanad khali bashad.${NC}"
-        read -p "IP Server Kharej: " REMOTE_IP
+        echo -e "${RED}[!] IP cannot be empty.${NC}"
+        read -p "Outside Server IP: " REMOTE_IP
     done
 
-    read -p "KCP Port Server Kharej [Default: 8443]: " REMOTE_KCP_PORT
+    read -p "Outside KCP Port [Default: 8443]: " REMOTE_KCP_PORT
     REMOTE_KCP_PORT=${REMOTE_KCP_PORT:-8443}
 
-    read -p "Port-haie ke mikhahid forward shavand (Masalan: 2053 ya 2053,443,80) [Default: 2053]: " FORWARD_PORTS
+    read -p "Ports to forward (e.g. 2053 or 2053,443,80) [Default: 2053]: " FORWARD_PORTS
     FORWARD_PORTS=${FORWARD_PORTS:-2053}
 
-    read -p "MTU Size (Bayad ba Kharej yeki bashad) [Default: 1350]: " MTU_SIZE
+    read -p "MTU Size (Must match Outside node) [Default: 1350]: " MTU_SIZE
     MTU_SIZE=${MTU_SIZE:-1350}
 
-    read -p "Secret Key (Daghighan hamoon ke tooye Kharej zadid): " CIPHER_KEY
+    read -p "Security Key (Must match Outside node): " CIPHER_KEY
     while [ -z "$CIPHER_KEY" ]; do
-        echo -e "${RED}[!] Key nemitavanad khali bashad.${NC}"
-        read -p "Secret Key: " CIPHER_KEY
+        echo -e "${RED}[!] Key cannot be empty.${NC}"
+        read -p "Security Key: " CIPHER_KEY
     done
 
     IFS=',' read -ra PORT_LIST <<< "$FORWARD_PORTS"
     LISTEN_ARGS=""
     for PORT in "${PORT_LIST[@]}"; do
         P=$(echo "$PORT" | tr -d ' ')
-        LISTEN_ARGS="${LISTEN_ARGS} -L \"tcp://:${P}/127.0.0.1:${P}\" -L \"udp://:${P}/127.0.0.1:${P}\""
+        LISTEN_ARGS="${LISTEN_ARGS} -L \"tcp://:${P}/127.0.0.1:${P}?ttl=120s\" -L \"udp://:${P}/127.0.0.1:${P}?ttl=120s\""
         iptables -I INPUT -p tcp --dport "$P" -j ACCEPT 2>/dev/null || true
         iptables -I INPUT -p udp --dport "$P" -j ACCEPT 2>/dev/null || true
     done
@@ -163,7 +181,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/gost ${LISTEN_ARGS} -F "relay+kcp://${REMOTE_IP}:${REMOTE_KCP_PORT}?nodelay=1&interval=5&resend=1&nc=1&sndwnd=4096&rcvwnd=4096&mtu=${MTU_SIZE}&crypt=aes&key=${CIPHER_KEY}"
+ExecStart=/usr/local/bin/gost ${LISTEN_ARGS} -F "relay+kcp://${REMOTE_IP}:${REMOTE_KCP_PORT}?nodelay=1&interval=10&resend=1&nc=1&sndwnd=4096&rcvwnd=4096&mtu=${MTU_SIZE}&crypt=aes&key=${CIPHER_KEY}&keepalive=10s"
 Restart=always
 RestartSec=3
 
@@ -175,42 +193,43 @@ EOF
     systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
     systemctl restart "${SERVICE_NAME}"
 
-    echo -e "\n${GREEN}[✓] Server IRAN ba movafaghiat connect shod!${NC}"
+    echo -e "\n${GREEN}[✓] Iran Node connected and active.${NC}"
     echo -e "--------------------------------------------------"
     echo -e "Service Name   : ${CYAN}${SERVICE_NAME}${NC}"
     echo -e "Forward Ports  : ${CYAN}${FORWARD_PORTS}${NC}"
-    echo -e "Kharej Address : ${CYAN}${REMOTE_IP}:${REMOTE_KCP_PORT}${NC}"
+    echo -e "Destination    : ${CYAN}${REMOTE_IP}:${REMOTE_KCP_PORT}${NC}"
     echo -e "MTU            : ${CYAN}${MTU_SIZE}${NC}"
+    echo -e "Keep-Alive     : ${GREEN}Enabled (10s Heartbeat + 120s NAT TTL)${NC}"
     echo -e "--------------------------------------------------"
-    read -p "Enter bezanid ta be menu bargardid..." DUMMY
+    read -p "Press Enter to return to main menu..." DUMMY
 }
 
-# 3. Smart Network & MTU Diagnostic
+# 3. Network Diagnostics and Auto-MTU Sweeper
 test_network() {
     echo -e "\n${CYAN}==================================================${NC}"
-    echo -e "${GREEN}     Smart Network & MTU Diagnostic Tool          ${NC}"
+    echo -e "${GREEN}         Network & Auto-MTU Diagnostics           ${NC}"
     echo -e "${CYAN}==================================================${NC}"
 
-    read -p "IP Server Maghsad (Kharej): " DEST_IP
+    read -p "Remote Server IP / Hostname: " DEST_IP
     if [ -z "$DEST_IP" ]; then
-        echo -e "${RED}[!] IP khali ast.${NC}"
+        echo -e "${RED}[!] IP cannot be empty.${NC}"
         return
     fi
 
-    read -p "Port KCP (UDP) ya Port Service [Default: 8443]: " DEST_PORT
+    read -p "Target KCP Port [Default: 8443]: " DEST_PORT
     DEST_PORT=${DEST_PORT:-8443}
 
-    echo -e "\n${YELLOW}[1] Test Ping va Packet Loss...${NC}"
-    ping -c 4 "$DEST_IP" || echo -e "${RED}[!] ICMP Block ast.${NC}"
+    echo -e "\n${YELLOW}[1] Ping & Latency Check...${NC}"
+    ping -c 4 "$DEST_IP" || echo -e "${RED}[!] ICMP ping dropped.${NC}"
 
-    echo -e "\n${YELLOW}[2] Test Port ba Netcat...${NC}"
+    echo -e "\n${YELLOW}[2] Port Reachability Check...${NC}"
     if nc -z -v -w3 "$DEST_IP" "$DEST_PORT" 2>&1 | grep -q -E "succeeded|open"; then
-        echo -e "${GREEN}[✓] Port ${DEST_PORT} baz ast va pasokh midahad (TCP).${NC}"
+        echo -e "${GREEN}[✓] Port ${DEST_PORT} is reachable.${NC}"
     else
-        echo -e "${YELLOW}[!] Pasokhi daryaft nashod (Dar soorate KCP/UDP in mored tabiee ast).${NC}"
+        echo -e "${YELLOW}[!] Raw port check produced no direct ACK (Normal for silent UDP/KCP).${NC}"
     fi
 
-    echo -e "\n${YELLOW}[3] Test MTU Sweeping (Barresi behtarin MTU bedoone Packet Drop)...${NC}"
+    echo -e "\n${YELLOW}[3] MTU Sweeper (Checking fragmentation threshold)...${NC}"
     MTU_TESTS=(1500 1450 1400 1350 1300 1250)
     BEST_MTU=1350
 
@@ -218,7 +237,7 @@ test_network() {
         PACKET_SIZE=$((MTU - 28))
         echo -ne "Testing MTU ${MTU} (Payload: ${PACKET_SIZE})... "
         if ping -M do -s "$PACKET_SIZE" -c 2 -W 2 "$DEST_IP" >/dev/null 2>&1; then
-            echo -e "${GREEN}OK (Bedoone Fragment)${NC}"
+            echo -e "${GREEN}Passed (No Fragmentation)${NC}"
             BEST_MTU=$MTU
             break
         else
@@ -227,25 +246,75 @@ test_network() {
     done
 
     echo -e "\n--------------------------------------------------"
-    echo -e "Pishnahad baraye MTU Tunnel: ${GREEN}${BEST_MTU}${NC}"
+    echo -e "Recommended MTU: ${GREEN}${BEST_MTU}${NC}"
     echo -e "--------------------------------------------------"
-    read -p "Enter bezanid ta be menu bargardid..." DUMMY
+    read -p "Press Enter to return..." DUMMY
 }
 
-# 4 & 5. Unified Interactive Tunnel Selector & Manager
+# 4. Auto-Restart Scheduled Watchdog
+setup_timer() {
+    echo -e "\n${CYAN}==================================================${NC}"
+    echo -e "${GREEN}            Auto-Restart Tunnel Timer             ${NC}"
+    echo -e "${CYAN}==================================================${NC}"
+    echo "1. Restart tunnels every 1 Hour (Recommended)"
+    echo "2. Restart tunnels every 3 Hours"
+    echo "3. Restart tunnels every 6 Hours"
+    echo "4. Custom interval (in hours)"
+    echo "5. Disable and Remove Auto-Restart Timer"
+    echo "0. Back to Main Menu"
+    echo "--------------------------------------------------"
+    read -p "Select option [0-5]: " TIMER_CHOICE
+
+    CRON_FILE="/etc/cron.d/gost-autorestart"
+
+    case $TIMER_CHOICE in
+        1)
+            echo "0 * * * * root systemctl restart 'gost-*' >/dev/null 2>&1" > "$CRON_FILE"
+            chmod 644 "$CRON_FILE"
+            echo -e "${GREEN}[✓] Auto-restart set to EVERY 1 HOUR.${NC}"
+            ;;
+        2)
+            echo "0 */3 * * * root systemctl restart 'gost-*' >/dev/null 2>&1" > "$CRON_FILE"
+            chmod 644 "$CRON_FILE"
+            echo -e "${GREEN}[✓] Auto-restart set to EVERY 3 HOURS.${NC}"
+            ;;
+        3)
+            echo "0 */6 * * * root systemctl restart 'gost-*' >/dev/null 2>&1" > "$CRON_FILE"
+            chmod 644 "$CRON_FILE"
+            echo -e "${GREEN}[✓] Auto-restart set to EVERY 6 HOURS.${NC}"
+            ;;
+        4)
+            read -p "Enter interval in hours (1-23): " CUSTOM_H
+            if [[ "$CUSTOM_H" =~ ^[0-9]+$ ]] && [ "$CUSTOM_H" -ge 1 ] && [ "$CUSTOM_H" -le 23 ]; then
+                echo "0 */${CUSTOM_H} * * * root systemctl restart 'gost-*' >/dev/null 2>&1" > "$CRON_FILE"
+                chmod 644 "$CRON_FILE"
+                echo -e "${GREEN}[✓] Auto-restart set to EVERY ${CUSTOM_H} HOURS.${NC}"
+            else
+                echo -e "${RED}[!] Invalid hour value.${NC}"
+            fi
+            ;;
+        5)
+            rm -f "$CRON_FILE"
+            echo -e "${YELLOW}[✓] Auto-restart timer disabled and removed.${NC}"
+            ;;
+        *) return ;;
+    esac
+    read -p "Press Enter to return..." DUMMY
+}
+
+# 5, 6, 7. Unified Interactive Tunnel Selector
 tunnel_selector_action() {
-    local ACTION_MODE="$1"  # "delete", "edit", or "manage"
+    local ACTION_MODE="$1"  # "edit", "delete", or "manage"
     clear
     echo -e "${CYAN}==================================================================${NC}"
-    echo -e "${GREEN}                  LIST VA VAZIATE TUNNEL-HA                       ${NC}"
+    echo -e "${GREEN}                       INSTALLED TUNNELS                          ${NC}"
     echo -e "${CYAN}==================================================================${NC}"
 
-    # Find services
     mapfile -t SVC_FILES < <(ls /etc/systemd/system/gost-*.service 2>/dev/null || true)
 
     if [ ${#SVC_FILES[@]} -eq 0 ]; then
-        echo -e "${YELLOW}Hich tunnele gost nasb shodeii rooye in server yaft nashod!${NC}"
-        read -p "Enter bezanid ta be menu bargardid..." DUMMY
+        echo -e "${YELLOW}No active GOST tunnels found on this server.${NC}"
+        read -p "Press Enter to return..." DUMMY
         return
     fi
 
@@ -256,45 +325,37 @@ tunnel_selector_action() {
         SVC_NAME=$(basename "$FILE" .service)
         SVC_MAP[$INDEX]="$SVC_NAME"
 
-        # Check Active Status
         if systemctl is-active --quiet "$SVC_NAME"; then
-            STATUS_STR="${GREEN}● ACTIVE${NC}"
+            STATUS_STR="${GREEN}ACTIVE${NC}"
         else
-            STATUS_STR="${RED}○ INACTIVE / STOPPED${NC}"
+            STATUS_STR="${RED}INACTIVE${NC}"
         fi
 
-        # Parse ExecStart line
         EXEC_LINE=$(grep "^ExecStart=" "$FILE" 2>/dev/null || echo "")
+        MTU_VAL=$(echo "$EXEC_LINE" | grep -o 'mtu=[0-9]*' | cut -d '=' -f 2 || echo "1350")
 
-        # Extract MTU
-        MTU_VAL=$(echo "$EXEC_LINE" | grep -o 'mtu=[0-9]*' | cut -d '=' -f 2 || echo "Default")
-        [ -z "$MTU_VAL" ] && MTU_VAL="1350"
-
-        # Check if Kharej (Server) or Iran (Client)
         if [[ "$SVC_NAME" == *"server"* ]]; then
-            ROLE="${MAGENTA}[KHAREJ / SERVER]${NC}"
+            ROLE="${MAGENTA}[Server / Outside]${NC}"
             KCP_P=$(echo "$EXEC_LINE" | grep -o 'relay+kcp://:[0-9]*' | cut -d ':' -f 2 || echo "Unknown")
-            DETAILS="KCP Listen Port: ${CYAN}${KCP_P}${NC} | MTU: ${CYAN}${MTU_VAL}${NC}"
+            DETAILS="Listen Port: ${CYAN}${KCP_P}${NC} | MTU: ${CYAN}${MTU_VAL}${NC}"
         else
-            ROLE="${BLUE}[IRAN / CLIENT]${NC}"
-            # Extract Local Ports
+            ROLE="${BLUE}[Client / Iran]${NC}"
             PORTS_FWD=$(echo "$EXEC_LINE" | grep -o 'tcp://:[0-9]*/' | sed 's/tcp:\/\/://g' | sed 's/\///g' | tr '\n' ',' | sed 's/,$//')
             [ -z "$PORTS_FWD" ] && PORTS_FWD="Unknown"
-            # Extract Remote Dest
             REMOTE_DEST=$(echo "$EXEC_LINE" | grep -o 'relay+kcp://[^?]*' | sed 's/relay+kcp:\/\///')
             [ -z "$REMOTE_DEST" ] && REMOTE_DEST="Unknown"
-            DETAILS="Forward Ports: ${CYAN}${PORTS_FWD}${NC} -> Dest: ${CYAN}${REMOTE_DEST}${NC} | MTU: ${CYAN}${MTU_VAL}${NC}"
+            DETAILS="Ports: ${CYAN}${PORTS_FWD}${NC} -> Dest: ${CYAN}${REMOTE_DEST}${NC} | MTU: ${CYAN}${MTU_VAL}${NC}"
         fi
 
-        echo -e "${YELLOW}[${INDEX}]${NC} Service: ${GREEN}${SVC_NAME}${NC} | Status: ${STATUS_STR}"
+        echo -e "${YELLOW}[${INDEX}]${NC} Service: ${GREEN}${SVC_NAME}${NC} [${STATUS_STR}]"
         echo -e "    Role: ${ROLE} | ${DETAILS}"
         echo -e "${CYAN}------------------------------------------------------------------${NC}"
         ((INDEX++))
     done
 
-    echo -e "${YELLOW}[0]${NC} Bazgasht be Menu Asli"
+    echo -e "${YELLOW}[0]${NC} Back to Main Menu"
     echo -e "${CYAN}==================================================================${NC}"
-    read -p "Shomareye tunnel ra entekhab konid [0-$((INDEX-1))]: " SELECTED_NUM
+    read -p "Select tunnel index [0-$((INDEX-1))]: " SELECTED_NUM
 
     if [ "$SELECTED_NUM" == "0" ] || [ -z "$SELECTED_NUM" ]; then
         return
@@ -302,91 +363,90 @@ tunnel_selector_action() {
 
     CHOSEN_SVC="${SVC_MAP[$SELECTED_NUM]}"
     if [ -z "$CHOSEN_SVC" ]; then
-        echo -e "${RED}[!] Shomareye entekhab shode na-motabar ast.${NC}"
+        echo -e "${RED}[!] Invalid selection.${NC}"
         sleep 2
         return
     fi
 
-    # Perform action based on mode
     if [ "$ACTION_MODE" == "delete" ]; then
-        echo -e "\n${RED}Shoma dar hale pak kardane tunnel: ${YELLOW}${CHOSEN_SVC}${RED} hastid!${NC}"
-        read -p "Aya motmaen hastid? (y/n) [Default: n]: " CONFIRM_DEL
+        echo -e "\n${RED}You are about to delete: ${YELLOW}${CHOSEN_SVC}${NC}"
+        read -p "Confirm deletion? (y/n) [Default: n]: " CONFIRM_DEL
         if [[ "$CONFIRM_DEL" =~ ^[Yy]$ ]]; then
             systemctl stop "$CHOSEN_SVC" 2>/dev/null || true
             systemctl disable "$CHOSEN_SVC" 2>/dev/null || true
             rm -f "/etc/systemd/system/${CHOSEN_SVC}.service"
             systemctl daemon-reload
-            echo -e "${GREEN}[✓] Tunnel ${CHOSEN_SVC} ba movafaghiat kamelan pak shod.${NC}"
+            echo -e "${GREEN}[✓] Tunnel ${CHOSEN_SVC} deleted successfully.${NC}"
         else
-            echo -e "${YELLOW}[*] Amaliate hazf laghv shod.${NC}"
+            echo -e "${YELLOW}[*] Operation canceled.${NC}"
         fi
-        read -p "Enter bezanid..." DUMMY
+        read -p "Press Enter to return..." DUMMY
 
     elif [ "$ACTION_MODE" == "edit" ]; then
-        echo -e "\n${CYAN}--- Virayeshe Tunnel: ${GREEN}${CHOSEN_SVC}${CYAN} ---${NC}"
-        echo "1. Virayeshe MTU (Sari va Automatic)"
-        echo "2. Baz kardane config tooye Nano (Edit dastori)"
-        echo "3. Restart Kardane Service"
-        echo "4. Bazgasht"
-        read -p "Entekhab konid [1-4]: " EDIT_CHOICE
+        echo -e "\n${CYAN}--- Edit Tunnel: ${GREEN}${CHOSEN_SVC}${CYAN} ---${NC}"
+        echo "1. Change MTU Value"
+        echo "2. Manual edit with Nano"
+        echo "3. Restart Service"
+        echo "0. Back"
+        read -p "Select action [0-3]: " EDIT_OPT
 
-        case $EDIT_CHOICE in
+        case $EDIT_OPT in
             1)
-                read -p "MTU jadid ra vared konid [Masalan 1300]: " NEW_MTU
+                read -p "Enter new MTU [e.g. 1300]: " NEW_MTU
                 if [ -n "$NEW_MTU" ]; then
                     sed -i -E "s/mtu=[0-9]+/mtu=${NEW_MTU}/g" "/etc/systemd/system/${CHOSEN_SVC}.service"
                     systemctl daemon-reload
                     systemctl restart "$CHOSEN_SVC"
-                    echo -e "${GREEN}[✓] MTU be ${NEW_MTU} taghir yaft va tunnel restart shod.${NC}"
+                    echo -e "${GREEN}[✓] MTU updated to ${NEW_MTU} and tunnel restarted.${NC}"
                 fi
-                read -p "Enter bezanid..." DUMMY
+                read -p "Press Enter to return..." DUMMY
                 ;;
             2)
                 nano "/etc/systemd/system/${CHOSEN_SVC}.service"
                 systemctl daemon-reload
                 systemctl restart "$CHOSEN_SVC"
-                echo -e "${GREEN}[✓] Taghirat zakhire va tunnel restart shod.${NC}"
-                read -p "Enter bezanid..." DUMMY
+                echo -e "${GREEN}[✓] Service configuration reloaded and restarted.${NC}"
+                read -p "Press Enter to return..." DUMMY
                 ;;
             3)
                 systemctl restart "$CHOSEN_SVC"
-                echo -e "${GREEN}[✓] Service restart shod.${NC}"
+                echo -e "${GREEN}[✓] Tunnel restarted.${NC}"
                 sleep 2
                 ;;
             *) return ;;
         esac
 
     elif [ "$ACTION_MODE" == "manage" ]; then
-        echo -e "\n${CYAN}--- Modiriate Tunnel: ${GREEN}${CHOSEN_SVC}${CYAN} ---${NC}"
-        echo "1. Moshahedeye Status daghigh (Systemctl Status)"
-        echo "2. Moshahedeye Live Logs (Zende)"
-        echo "3. Restart Kardane Service"
-        echo "4. Stop / Start Service"
-        echo "5. Bazgasht"
-        read -p "Entekhab konid [1-5]: " MNG_CHOICE
+        echo -e "\n${CYAN}--- Manage Tunnel: ${GREEN}${CHOSEN_SVC}${CYAN} ---${NC}"
+        echo "1. Show Systemctl Status"
+        echo "2. Follow Live Logs"
+        echo "3. Restart Service"
+        echo "4. Toggle Start / Stop"
+        echo "0. Back"
+        read -p "Select action [0-4]: " MNG_CHOICE
 
         case $MNG_CHOICE in
             1)
                 systemctl status "$CHOSEN_SVC" --no-pager
-                read -p "Enter bezanid..." DUMMY
+                read -p "Press Enter to return..." DUMMY
                 ;;
             2)
-                echo -e "${YELLOW}[!] Baraye khorooj az halate log Ctrl+C ra bezanid.${NC}"
+                echo -e "${YELLOW}[!] Press Ctrl+C to exit logs.${NC}"
                 sleep 1
                 journalctl -u "$CHOSEN_SVC" -f -n 30
                 ;;
             3)
                 systemctl restart "$CHOSEN_SVC"
-                echo -e "${GREEN}[✓] Service restart shod.${NC}"
+                echo -e "${GREEN}[✓] Tunnel restarted.${NC}"
                 sleep 2
                 ;;
             4)
                 if systemctl is-active --quiet "$CHOSEN_SVC"; then
                     systemctl stop "$CHOSEN_SVC"
-                    echo -e "${YELLOW}[!] Service Stop shod.${NC}"
+                    echo -e "${YELLOW}[!] Tunnel stopped.${NC}"
                 else
                     systemctl start "$CHOSEN_SVC"
-                    echo -e "${GREEN}[✓] Service Start shod.${NC}"
+                    echo -e "${GREEN}[✓] Tunnel started.${NC}"
                 fi
                 sleep 2
                 ;;
@@ -400,28 +460,30 @@ main_menu() {
     while true; do
         clear
         echo -e "${CYAN}==================================================${NC}"
-        echo -e "${GREEN}         GOST KCP+AES Dual-Tunnel Manager         ${NC}"
+        echo -e "${GREEN}         GOST KCP+AES Tunnel Manager              ${NC}"
         echo -e "${CYAN}==================================================${NC}"
-        echo -e "1. ${BLUE}[AVAL INJA]${NC} Setup Server KHAREJ (Outside Node)"
-        echo -e "2. ${BLUE}[DOVVOM INJA]${NC} Setup Server IRAN (Client/Relay)"
-        echo -e "3. Smart Network & Auto MTU Diagnostic (Test Ettesal)"
-        echo -e "4. ${YELLOW}[EDIT]${NC} List va Virayeshe Tunnel-ha (MTU, Config)"
-        echo -e "5. ${RED}[DELETE]${NC} List va Hazfe Sari-e Tunnel-ha (Ba Shomare)"
-        echo -e "6. ${MAGENTA}[STATUS/LOG]${NC} Modiriat, Status va Log-e Zende"
-        echo -e "7. Exit"
+        echo -e "1. ${BLUE}[STEP 1]${NC} Setup Outside Node (Server)"
+        echo -e "2. ${BLUE}[STEP 2]${NC} Setup Iran Node (Client)"
+        echo -e "3. Network Diagnostics & Auto-MTU Sweeper"
+        echo -e "4. Configure Auto-Restart Timer (Watchdog)"
+        echo -e "5. ${YELLOW}[EDIT]${NC}   Edit Tunnel Configuration (MTU / Ports)"
+        echo -e "6. ${RED}[DELETE]${NC} Delete Tunnel by Index Number"
+        echo -e "7. ${MAGENTA}[STATUS]${NC} View Status & Live Logs"
+        echo -e "8. Exit"
         echo -e "${CYAN}==================================================${NC}"
-        read -p "Lotfan yek gozine ra entekhab konid [1-7]: " MENU_CHOICE
+        read -p "Select an option [1-8]: " MENU_CHOICE
 
         case $MENU_CHOICE in
-            1) setup_kharej ;;
+            1) setup_outside ;;
             2) setup_iran ;;
             3) test_network ;;
-            4) tunnel_selector_action "edit" ;;
-            5) tunnel_selector_action "delete" ;;
-            6) tunnel_selector_action "manage" ;;
-            7) exit 0 ;;
+            4) setup_timer ;;
+            5) tunnel_selector_action "edit" ;;
+            6) tunnel_selector_action "delete" ;;
+            7) tunnel_selector_action "manage" ;;
+            8) exit 0 ;;
             *)
-                echo -e "${RED}[!] Entekhab eshtebah ast.${NC}"
+                echo -e "${RED}[!] Invalid selection.${NC}"
                 sleep 1
                 ;;
         esac
