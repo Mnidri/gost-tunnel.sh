@@ -22,14 +22,15 @@ get_public_ip() {
     curl -s4 --max-time 3 https://api.ipify.org || curl -s4 --max-time 3 https://ifconfig.me || echo "127.0.0.1"
 }
 
-# Optimize Linux Network Kernel for UDP Keep-Alive
+# Optimize Linux Network Kernel for UDP Keep-Alive & Port-Hopping
 optimize_kernel() {
     echo -e "${YELLOW}[+] Optimizing system network parameters...${NC}"
     cat <<EOF > /etc/sysctl.d/99-gost-tunnel.conf
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-net.netfilter.nf_conntrack_udp_timeout=120
-net.netfilter.nf_conntrack_udp_timeout_stream=300
+net.netfilter.nf_conntrack_udp_timeout=15
+net.netfilter.nf_conntrack_udp_timeout_stream=60
+net.netfilter.nf_conntrack_max=1048576
 net.core.rmem_max=67108864
 net.core.wmem_max=67108864
 EOF
@@ -50,18 +51,21 @@ install_dependencies() {
         echo -e "${YELLOW}[+] Downloading GOST core binary...${NC}"
         ARCH=$(uname -m)
         case $ARCH in
-            x86_64) GOST_ARCH="linux-amd64" ;;
-            aarch64) GOST_ARCH="linux-arm64" ;;
-            armv7l) GOST_ARCH="linux-armv7" ;;
+            x86_64)  GOST_FILE="gost_2.11.5_linux_amd64.tar.gz" ;;
+            aarch64) GOST_FILE="gost_2.11.5_linux_arm64.tar.gz" ;;
+            armv7l)  GOST_FILE="gost_2.11.5_linux_armv7.tar.gz" ;;
             *) echo -e "${RED}[!] Architecture $ARCH is not supported.${NC}"; exit 1 ;;
         esac
 
-        LATEST_URL=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep "browser_download_url.*${GOST_ARCH}.*tar.gz" | head -n 1 | cut -d '"' -f 4)
-        if [ -z "$LATEST_URL" ]; then
-            LATEST_URL="https://github.com/go-gost/gost/releases/download/v3.0.0-rc10/gost_3.0.0-rc10_${GOST_ARCH}.tar.gz"
+        DOWNLOAD_URL="https://github.com/ginuerzh/gost/releases/download/v2.11.5/${GOST_FILE}"
+
+        if ! curl -fsSL -o /tmp/gost.tar.gz "$DOWNLOAD_URL"; then
+            wget -qO /tmp/gost.tar.gz "$DOWNLOAD_URL" || {
+                echo -e "${RED}[!] Failed to download GOST binary.${NC}"
+                exit 1
+            }
         fi
 
-        wget -qO /tmp/gost.tar.gz "$LATEST_URL"
         tar -xzf /tmp/gost.tar.gz -C /tmp/
         mv /tmp/gost /usr/local/bin/gost
         chmod +x /usr/local/bin/gost
@@ -86,8 +90,18 @@ setup_outside() {
     TUNNEL_NAME=${TUNNEL_NAME:-main}
     SERVICE_NAME="gost-server-${TUNNEL_NAME}"
 
-    read -p "KCP Listen Port [Default: 8443]: " KCP_PORT
+    read -p "KCP Base Internal Port [Default: 8443]: " KCP_PORT
     KCP_PORT=${KCP_PORT:-8443}
+
+    read -p "Enable Port-Hopping (50 Ports)? (y/n) [Default: y]: " ENABLE_HOP
+    ENABLE_HOP=${ENABLE_HOP:-y}
+
+    if [[ "$ENABLE_HOP" =~ ^[Yy]$ ]]; then
+        read -p "Start of 50-Port Range [Default: 42000]: " HOP_START
+        HOP_START=${HOP_START:-42000}
+        HOP_END=$((HOP_START + 50))
+        HOP_RANGE="${HOP_START}:${HOP_END}"
+    fi
 
     read -p "MTU Size [Default: 1350]: " MTU_SIZE
     MTU_SIZE=${MTU_SIZE:-1350}
@@ -98,6 +112,11 @@ setup_outside() {
     CIPHER_KEY=${CIPHER_KEY:-$SUGGESTED_KEY}
 
     iptables -I INPUT -p udp --dport "$KCP_PORT" -j ACCEPT 2>/dev/null || true
+
+    if [[ "$ENABLE_HOP" =~ ^[Yy]$ ]]; then
+        iptables -I INPUT -p udp --dport "$HOP_RANGE" -j ACCEPT 2>/dev/null || true
+        iptables -t nat -I PREROUTING -p udp --dport "$HOP_RANGE" -j REDIRECT --to-ports "$KCP_PORT" 2>/dev/null || true
+    fi
 
     cat <<EOF > /etc/systemd/system/${SERVICE_NAME}.service
 [Unit]
@@ -122,11 +141,16 @@ EOF
     MY_IP=$(get_public_ip)
     echo -e "\n${GREEN}[✓] Outside Node configured and running.${NC}"
     echo -e "--------------------------------------------------"
-    echo -e "Tunnel Name  : ${CYAN}${TUNNEL_NAME}${NC}"
-    echo -e "Server IP    : ${CYAN}${MY_IP}${NC}"
-    echo -e "KCP Port     : ${CYAN}${KCP_PORT}${NC}"
-    echo -e "MTU          : ${CYAN}${MTU_SIZE}${NC}"
-    echo -e "Security Key : ${YELLOW}${CIPHER_KEY}${NC}"
+    echo -e "Tunnel Name   : ${CYAN}${TUNNEL_NAME}${NC}"
+    echo -e "Server IP     : ${CYAN}${MY_IP}${NC}"
+    echo -e "KCP Base Port : ${CYAN}${KCP_PORT}${NC}"
+    if [[ "$ENABLE_HOP" =~ ^[Yy]$ ]]; then
+        echo -e "Port-Hopping  : ${GREEN}Active (Range: ${HOP_RANGE})${NC}"
+    else
+        echo -e "Port-Hopping  : ${YELLOW}Disabled${NC}"
+    fi
+    echo -e "MTU           : ${CYAN}${MTU_SIZE}${NC}"
+    echo -e "Security Key  : ${YELLOW}${CIPHER_KEY}${NC}"
     echo -e "--------------------------------------------------"
     read -p "Press Enter to return to main menu..." DUMMY
 }
@@ -149,8 +173,19 @@ setup_iran() {
         read -p "Outside Server IP: " REMOTE_IP
     done
 
-    read -p "Outside KCP Port [Default: 8443]: " REMOTE_KCP_PORT
-    REMOTE_KCP_PORT=${REMOTE_KCP_PORT:-8443}
+    read -p "Is Port-Hopping enabled on Outside? (y/n) [Default: y]: " HOP_ENABLED
+    HOP_ENABLED=${HOP_ENABLED:-y}
+
+    if [[ "$HOP_ENABLED" =~ ^[Yy]$ ]]; then
+        read -p "Outside Start Port of 50-Range [Default: 42000]: " HOP_START
+        HOP_START=${HOP_START:-42000}
+        HOP_END=$((HOP_START + 50))
+        # Pick a target port inside the active 50-port range
+        REMOTE_KCP_PORT=$((HOP_START + RANDOM % 50))
+    else
+        read -p "Outside KCP Port [Default: 8443]: " REMOTE_KCP_PORT
+        REMOTE_KCP_PORT=${REMOTE_KCP_PORT:-8443}
+    fi
 
     read -p "Ports to forward (e.g. 2053 or 2053,443,80) [Default: 2053]: " FORWARD_PORTS
     FORWARD_PORTS=${FORWARD_PORTS:-2053}
